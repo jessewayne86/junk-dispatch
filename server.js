@@ -1,8 +1,13 @@
 import express from "express";
 import bodyParser from "body-parser";
+import twilio from "twilio";
 
 const app = express();
+
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false })); // <-- required for Twilio
+
+// ===== EXISTING ROUTES =====
 
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
@@ -25,7 +30,38 @@ app.post("/intake", (req, res) => {
   });
 });
 
+// ===== NEW TWILIO SMS ROUTE =====
+
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+const OWNER_PHONE = process.env.OWNER_PHONE;
+const BUSINESS_PHONE = process.env.TWILIO_NUMBER;
+
+app.post("/webhooks/sms", async (req, res) => {
+  const from = req.body.From;
+  const body = req.body.Body;
+
+  console.log("Inbound SMS:", { from, body });
+
+  try {
+    await twilioClient.messages.create({
+      from: BUSINESS_PHONE,
+      to: OWNER_PHONE,
+      body: `📩 New Message\nFrom: ${from}\n\n"${body}"`,
+    });
+  } catch (err) {
+    console.error("Notification failed:", err);
+  }
+
+  res.status(200).send("ok");
+});
+
+// ===== SERVER START =====
+
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
+app.listen(port, "0.0.0.0", () => {
   console.log("Listening on port", port);
 });
