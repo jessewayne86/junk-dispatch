@@ -46,15 +46,30 @@ app.post("/webhooks/sms", async (req, res) => {
 
   console.log("Inbound SMS:", { from, body });
 
-  try {
-    await twilioClient.messages.create({
-      from: BUSINESS_PHONE,
-      to: OWNER_PHONE,
-      body: `📩 New Message\nFrom: ${from}\n\n"${body}"`,
-    });
-  } catch (err) {
-    console.error("Notification failed:", err);
-  }
+  console.log("Notify vars:", {
+  OWNER_PHONE,
+  BUSINESS_PHONE,
+  hasSid: !!process.env.TWILIO_ACCOUNT_SID,
+  hasToken: !!process.env.TWILIO_AUTH_TOKEN
+});
+
+try {
+  console.log("Attempting notification send...");
+  const msg = await twilioClient.messages.create({
+    from: BUSINESS_PHONE,
+    to: OWNER_PHONE,
+    body: `📩 New Message\nFrom: ${from}\n\n"${body}"`,
+  });
+
+  console.log("Notification SENT. SID:", msg.sid);
+} catch (err) {
+  console.error("Notification FAILED:", {
+    status: err?.status,
+    code: err?.code,
+    message: err?.message,
+    moreInfo: err?.moreInfo
+  });
+}
 
   res.status(200).send("ok");
 });
