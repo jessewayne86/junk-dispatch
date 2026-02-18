@@ -22,29 +22,41 @@ app.post("/twilio/call-status", (req, res) => {
   console.log("Twilio call status:", req.body);
   res.status(200).send("ok");
 });
-app.post("/intake", (req, res) => {
+app.post("/intake", async (req, res) => {
   console.log("Intake:", req.body);
 
   const jobId = "job_" + Math.random().toString(36).slice(2, 9);
   const base = process.env.BASE_URL || "https://example.com";
 
-  res.json({
+  // Push to Google Sheet (Apps Script webhook)
+  try {
+    if (!process.env.SHEETS_WEBHOOK_URL) {
+      console.warn("SHEETS_WEBHOOK_URL is missing; skipping sheet write.");
+    } else {
+      await fetch(process.env.SHEETS_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: req.body.name || "",
+          phone: req.body.phone || req.body.from || "",
+          address: req.body.address || "",
+          description: req.body.description || "",
+          jobId
+        }),
+      });
+      console.log("✅ Sheet write attempted for", jobId);
+    }
+  } catch (err) {
+    console.error("❌ Sheet write failed:", err?.message || err);
+    // Don't fail the intake response just because Sheets failed
+  }
+
+  return res.json({
     jobId,
-    photoLink: `${base}/upload?job=${jobId}`
+    photoLink: `${base}/upload?job=${jobId}`,
   });
 });
 
-await fetch(process.env.SHEETS_WEBHOOK_URL, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    name: req.body.name,
-    phone: req.body.phone,
-    address: req.body.address,
-    description: req.body.description,
-    jobId: jobId
-  })
-});
 
 
 // ===== NEW TWILIO SMS ROUTE =====
