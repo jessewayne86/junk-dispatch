@@ -34,6 +34,19 @@ app.post("/intake", (req, res) => {
   });
 });
 
+await fetch(process.env.SHEETS_WEBHOOK_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    name: req.body.name,
+    phone: req.body.phone,
+    address: req.body.address,
+    description: req.body.description,
+    jobId: jobId
+  })
+});
+
+
 // ===== NEW TWILIO SMS ROUTE =====
 
 const twilioClient = twilio(
