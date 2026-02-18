@@ -18,6 +18,10 @@ app.post("/vapi/webhook", (req, res) => {
   res.status(200).send("ok");
 });
 
+app.post("/twilio/call-status", (req, res) => {
+  console.log("Twilio call status:", req.body);
+  res.status(200).send("ok");
+});
 app.post("/intake", (req, res) => {
   console.log("Intake:", req.body);
 
