@@ -29,32 +29,55 @@ async function postToSheet(payload) {
 }
 
 function buildPayloadFromStructuredData(sd, jobId) {
+  const phone =
+    sd?.callbackNumber && sd.callbackNumber !== "Same number"
+      ? sd.callbackNumber
+      : (sd?.phone || sd?.from || "");
+
+  const specialItemsText = Array.isArray(sd?.specialItems)
+    ? sd.specialItems.join(", ")
+    : (sd?.specialItems || "");
+
+  // Build a clean scope description (still one cell, but structured)
+  const scopeParts = [
+    sd?.jobType ? `jobType: ${sd.jobType}` : "",
+    sd?.location ? `location: ${sd.location}` : "",
+    sd?.size ? `size: ${sd.size}` : "",
+    sd?.access ? `access: ${Array.isArray(sd.access) ? sd.access.join(", ") : sd.access}` : "",
+    specialItemsText ? `specialItems: ${specialItemsText}` : "",
+    sd?.deadline ? `deadline: ${sd.deadline}` : "",
+  ].filter(Boolean);
+
   return {
-    jobId,
-    name: sd?.name || "",
-    phone:
-      sd?.callbackNumber && sd.callbackNumber !== "Same number"
-        ? sd.callbackNumber
-        : (sd?.phone || sd?.from || ""),
-    address: sd?.serviceAddress || sd?.address || "",
-    description: [
-      sd?.jobType ? `jobType: ${sd.jobType}` : "",
-      sd?.location ? `location: ${sd.location}` : "",
-      sd?.size ? `size: ${sd.size}` : "",
-      sd?.tier ? `tier: ${sd.tier}` : "",
-      sd?.deadline ? `deadline: ${sd.deadline}` : "",
-      sd?.preferredWindow ? `preferredWindow: ${sd.preferredWindow}` : "",
-      Array.isArray(sd?.specialItems) && sd.specialItems.length
-        ? `specialItems: ${sd.specialItems.join(", ")}`
-        : "",
-      sd?.escalate ? `escalate: true (${sd?.escalationReason || ""})` : "",
-    ]
-      .filter(Boolean)
-      .join(" | "),
-    source: "call-end",
-    timestamp: new Date().toISOString(),
+    // ✅ Match your sheet columns (Jobs header row)
+    "Job ID": jobId,
+    "Created At": new Date().toISOString(),
+    "Source": sd?.source || "vapi",
+
+    "Customer Name": sd?.name || "",
+    "Customer Phone": phone,
+    "Customer Email": sd?.email || "",
+
+    "Service Address": sd?.serviceAddress || sd?.address || "",
+    "City/ZIP": sd?.cityZip || sd?.city || sd?.zip || "",
+
+    "Job Type": sd?.jobType || "",
+    "Items / Scope Description": scopeParts.join(" | "),
+
+    "Preferred Timing": sd?.preferredWindow || "",
+    "Urgent (Y/N)": (sd?.urgent || sd?.urgent_flag) ? "Y" : "N",
+
+    "Photos Link": sd?.photoLink || "",
+
+    // You can use these for internal tracking on intake
+    "Intake Notes": sd?.intakeNotes || "",
+    "Status": sd?.status || "New",
+
+    // Optional: helps debugging
+    "Webhook Event": "call-end",
   };
 }
+
 
 // ===== ROUTES =====
 app.get("/health", (req, res) => {
