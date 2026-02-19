@@ -1,49 +1,101 @@
+// server.js
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
 
+// Node 18+ has fetch built-in. If your runtime is older, install node-fetch.
 const app = express();
 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "10mb" }));
 app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends form-encoded by default
 
-// ===== CALLID -> JOBID (for end-of-call update) =====
-// NOTE: This is in-memory. If Railway restarts mid-call, mapping can be lost.
-// Best long-term: store this in a DB/Redis OR ensure jobId is included in end-of-call structured data.
-const callIdToJobId = new Map();
+// ===================== CONFIG =====================
+// REQUIRED: your Apps Script Web App URL (the upsert-by-Job-ID endpoint)
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL;
 
-function getCallIdFromVapiMessage(message) {
-  return (
-    message?.call?.id ||
-    message?.callId ||
-    message?.conversationId ||
-    message?.id ||
-    null
-  );
-}
+// OPTIONAL: used to generate upload links
+const BASE_URL = process.env.BASE_URL || "https://example.com";
 
-// ===== HELPERS =====
+// Twilio notify
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const OWNER_PHONE = process.env.OWNER_PHONE;
+const BUSINESS_PHONE = process.env.TWILIO_NUMBER;
+
+// ===================== HELPERS =====================
 async function postToSheet(payload) {
-  if (!process.env.SHEETS_WEBHOOK_URL) {
+  if (!SHEETS_WEBHOOK_URL) {
     console.warn("SHEETS_WEBHOOK_URL is missing; skipping sheet write.");
-    return;
+    return { skipped: true };
   }
 
-  const r = await fetch(process.env.SHEETS_WEBHOOK_URL, {
+  const r = await fetch(SHEETS_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   const text = await r.text().catch(() => "");
-  console.log("Sheets status:", r.status, "body:", text);
+  console.log("Sheets status:", r.status, "body:", text.slice(0, 1500));
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
 
   if (!r.ok) {
     throw new Error(`Sheets webhook failed: ${r.status} ${text}`);
   }
+
+  return json;
 }
 
-function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
+function generateJobId() {
+  return "job_" + Math.random().toString(36).slice(2, 9);
+}
+
+// ===== VAPI CALL ↔ JOB MAPPING (simple + works now) =====
+const callToJob = new Map();
+
+function getCallId(message) {
+  return (
+    message?.call?.id ||
+    message?.callId ||
+    message?.call_id ||
+    message?.message?.call?.id ||
+    message?.event?.call?.id ||
+    ""
+  );
+}
+
+function getToolCalls(message) {
+  // Vapi payloads vary — support a few common shapes
+  return (
+    message?.toolCalls ||
+    message?.tool_calls ||
+    message?.message?.toolCalls ||
+    message?.message?.tool_calls ||
+    []
+  );
+}
+
+function getToolName(tc) {
+  return tc?.name || tc?.toolName || tc?.function?.name || "";
+}
+
+function getToolArgs(tc) {
+  return tc?.args || tc?.arguments || tc?.function?.arguments || {};
+}
+
+function getToolCallId(tc) {
+  return tc?.id || tc?.toolCallId || tc?.tool_call_id || "";
+}
+
+function buildPayloadFromStructuredData(sd, jobId) {
   const phone =
     sd?.callbackNumber && sd.callbackNumber !== "Same number"
       ? sd.callbackNumber
@@ -53,16 +105,12 @@ function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
     ? sd.specialItems.join(", ")
     : (sd?.specialItems || "");
 
-  const accessText = Array.isArray(sd?.access)
-    ? sd.access.join(", ")
-    : (sd?.access || "");
-
   // Build a clean scope description (still one cell, but structured)
   const scopeParts = [
     sd?.jobType ? `jobType: ${sd.jobType}` : "",
     sd?.location ? `location: ${sd.location}` : "",
     sd?.size ? `size: ${sd.size}` : "",
-    accessText ? `access: ${accessText}` : "",
+    sd?.access ? `access: ${Array.isArray(sd.access) ? sd.access.join(", ") : sd.access}` : "",
     specialItemsText ? `specialItems: ${specialItemsText}` : "",
     sd?.deadline ? `deadline: ${sd.deadline}` : "",
   ].filter(Boolean);
@@ -71,7 +119,7 @@ function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
     // ✅ Match your sheet columns (Jobs header row)
     "Job ID": jobId,
     "Created At": new Date().toISOString(),
-    "Source": sourceValue,
+    "Source": sd?.source || "vapi",
 
     "Customer Name": sd?.name || "",
     "Customer Phone": phone,
@@ -83,7 +131,6 @@ function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
     "Job Type": sd?.jobType || "",
     "Items / Scope Description": scopeParts.join(" | "),
 
-    // Your sheet header is "Preferred Timing"
     "Preferred Timing": sd?.preferredWindow || "",
     "Urgent (Y/N)": (sd?.urgent || sd?.urgent_flag) ? "Y" : "N",
 
@@ -95,43 +142,162 @@ function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
   };
 }
 
-// ===== ROUTES =====
+// ===================== ROUTES =====================
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
 
 /**
  * VAPI WEBHOOK
- * This is where Vapi sends call events.
- * We write to the sheet when the call ends (end-of-call-report),
- * AND we reuse the jobId created during /intake so Apps Script can update the same row.
+ * Handles:
+ * - tool calls mid-call (create_intake/update_intake) -> writes/updates row immediately
+ * - end-of-call-report -> writes final snapshot to same Job ID
  */
 app.post("/vapi/webhook", async (req, res) => {
   try {
     const message = req.body;
 
-    // Keep your existing logging (trim to avoid log spam)
     console.log("Vapi event:", JSON.stringify(message).slice(0, 2000));
 
-    // ✅ Only write to sheet on end-of-call-report (best signal + clean data)
+    // 1) TOOL CALLS (mid-call)
+    const toolCalls = getToolCalls(message);
+    if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+      const callId = String(getCallId(message) || "").trim();
+      const toolCallResults = [];
+
+      for (const tc of toolCalls) {
+        const toolName = getToolName(tc);
+        const args = getToolArgs(tc);
+        const toolCallId = getToolCallId(tc);
+
+        // ---- create_intake ----
+        if (toolName === "create_intake") {
+          const resolvedCallId = String(args.callId || callId || "").trim();
+          if (!resolvedCallId) {
+            toolCallResults.push({
+              toolCallId,
+              result: { ok: false, error: "Missing callId" },
+            });
+            continue;
+          }
+
+          // Reuse or create jobId for this call
+          const existingJobId = callToJob.get(resolvedCallId);
+          const jobId = existingJobId || generateJobId();
+          callToJob.set(resolvedCallId, jobId);
+
+          // Prefer structured data if present, otherwise args
+          const sd =
+            message?.analysis?.structuredData ||
+            message?.message?.analysis?.structuredData ||
+            args;
+
+          const payload = {
+            ...buildPayloadFromStructuredData(sd, jobId),
+            "Call ID": resolvedCallId,
+            callId: resolvedCallId,
+            "Photos Link": sd?.photoLink || `${BASE_URL}/upload?job=${jobId}`,
+            "Webhook Event": "tool-create_intake",
+          };
+
+          try {
+            const sheetResp = await postToSheet(payload);
+            console.log("✅ Mid-call intake row written:", { jobId, callId: resolvedCallId });
+            toolCallResults.push({
+              toolCallId,
+              result: {
+                ok: true,
+                jobId,
+                photoLink: payload["Photos Link"],
+                sheet: sheetResp,
+              },
+            });
+          } catch (err) {
+            console.error("❌ Sheet write failed (create_intake):", err?.message || err);
+            toolCallResults.push({
+              toolCallId,
+              result: { ok: false, error: "Sheet write failed (create_intake)" },
+            });
+          }
+
+          continue;
+        }
+
+        // ---- update_intake ----
+        if (toolName === "update_intake") {
+          const resolvedCallId = String(args.callId || callId || "").trim();
+          const mappedJobId = resolvedCallId ? callToJob.get(resolvedCallId) : null;
+
+          const jobId = String(args.jobId || args["Job ID"] || mappedJobId || "").trim();
+          if (!jobId) {
+            toolCallResults.push({
+              toolCallId,
+              result: { ok: false, error: "Missing jobId (and no callId→jobId mapping found)" },
+            });
+            continue;
+          }
+
+          if (resolvedCallId) callToJob.set(resolvedCallId, jobId);
+
+          const sd =
+            message?.analysis?.structuredData ||
+            message?.message?.analysis?.structuredData ||
+            args;
+
+          const payload = {
+            ...buildPayloadFromStructuredData(sd, jobId),
+            "Call ID": resolvedCallId,
+            callId: resolvedCallId,
+            "Webhook Event": "tool-update_intake",
+          };
+
+          try {
+            const sheetResp = await postToSheet(payload);
+            console.log("✅ Intake updated:", { jobId, callId: resolvedCallId });
+            toolCallResults.push({
+              toolCallId,
+              result: { ok: true, jobId, sheet: sheetResp },
+            });
+          } catch (err) {
+            console.error("❌ Sheet write failed (update_intake):", err?.message || err);
+            toolCallResults.push({
+              toolCallId,
+              result: { ok: false, error: "Sheet write failed (update_intake)" },
+            });
+          }
+
+          continue;
+        }
+
+        // Unknown tool
+        toolCallResults.push({
+          toolCallId,
+          result: { ok: false, error: `Unhandled tool: ${toolName}` },
+        });
+      }
+
+      // IMPORTANT: Vapi expects toolCallResults for tool call events
+      return res.status(200).json({ toolCallResults });
+    }
+
+    // 2) END OF CALL REPORT (final snapshot)
     if (message?.type === "end-of-call-report") {
       const sd = message?.analysis?.structuredData || {};
+      const callId = String(getCallId(message) || "").trim();
 
-      const callId = getCallIdFromVapiMessage(message);
+      // Reuse mid-call jobId if available
+      const jobId = (callId && callToJob.get(callId)) ? callToJob.get(callId) : generateJobId();
 
-      // Prefer a jobId provided in structuredData (best, survives restarts),
-      // otherwise use in-memory map from /intake,
-      // otherwise fallback to a random jobId (will create a new row).
-      const jobId =
-        (sd && (sd["Job ID"] || sd.jobId)) ||
-        (callId ? callIdToJobId.get(callId) : null) ||
-        ("job_" + Math.random().toString(36).slice(2, 9));
-
-      const payload = buildPayloadFromStructuredData(sd, jobId, "call-end");
+      const payload = {
+        ...buildPayloadFromStructuredData(sd, jobId),
+        "Call ID": callId,
+        callId,
+        "Webhook Event": "call-end",
+      };
 
       try {
         await postToSheet(payload);
-        console.log("✅ End-of-call upsert sent:", { jobId, callId });
+        console.log("✅ End-of-call row written:", { jobId, callId });
       } catch (err) {
         console.error("❌ Sheet write failed (end-of-call):", err?.message || err);
       }
@@ -151,10 +317,8 @@ app.post("/twilio/call-status", (req, res) => {
 });
 
 /**
- * /intake
- * Called mid-call by create_intake tool.
- * It returns jobId + photoLink and writes the FIRST row (source: intake).
- * We also store callId -> jobId so end-of-call can update the same row.
+ * OPTIONAL: /intake
+ * Keep this if you ever add an HTTP tool later. Not required for the current Vapi tool-call flow.
  */
 app.post("/intake", async (req, res) => {
   console.log("Intake raw body:", JSON.stringify(req.body).slice(0, 2000));
@@ -164,53 +328,30 @@ app.post("/intake", async (req, res) => {
     req.body?.analysis?.structuredData ||
     req.body;
 
-  const jobId = "job_" + Math.random().toString(36).slice(2, 9);
-  const base = process.env.BASE_URL || "https://example.com";
-  const photoLink = `${base}/upload?job=${jobId}`;
+  const jobId = generateJobId();
 
-  // Try to capture callId from multiple possible shapes
-  const callId =
-    req.body?.call?.id ||
-    req.body?.callId ||
-    req.body?.message?.call?.id ||
-    req.body?.message?.callId ||
-    sd?.callId ||
-    null;
-
-  if (callId) {
-    callIdToJobId.set(callId, jobId);
-    console.log("✅ Stored callId -> jobId:", { callId, jobId });
-  } else {
-    console.warn("⚠️ No callId found on /intake; end-of-call may create a new row.");
-  }
-
-  // Ensure the sheet has the photo link on intake
-  const payload = buildPayloadFromStructuredData({ ...sd, photoLink }, jobId, "intake");
+  const payload = {
+    ...buildPayloadFromStructuredData(sd, jobId),
+    "Call ID": String(getCallId(req.body) || "").trim(),
+    "Photos Link": sd?.photoLink || `${BASE_URL}/upload?job=${jobId}`,
+    "Webhook Event": "http-intake",
+  };
 
   try {
     await postToSheet(payload);
-    console.log("✅ Intake row written:", { jobId, callId });
+    console.log("✅ Intake row written:", jobId);
   } catch (err) {
     console.error("❌ Sheet write failed (intake):", err?.message || err);
-    // Don't fail the call flow because Sheets failed
   }
 
   return res.json({
     ok: true,
     jobId,
-    photoLink,
+    photoLink: payload["Photos Link"],
   });
 });
 
 // ===== TWILIO SMS ROUTE =====
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
-
-const OWNER_PHONE = process.env.OWNER_PHONE;
-const BUSINESS_PHONE = process.env.TWILIO_NUMBER;
-
 app.post("/webhooks/sms", async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
