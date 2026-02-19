@@ -23,39 +23,59 @@ app.post("/twilio/call-status", (req, res) => {
   res.status(200).send("ok");
 });
 app.post("/intake", async (req, res) => {
-  console.log("Intake:", req.body);
+  console.log("Intake raw body:", JSON.stringify(req.body));
+
+  const sd =
+    req.body?.message?.analysis?.structuredData ||
+    req.body?.analysis?.structuredData ||
+    req.body;
 
   const jobId = "job_" + Math.random().toString(36).slice(2, 9);
   const base = process.env.BASE_URL || "https://example.com";
+
+  const payload = {
+    jobId,
+    name: sd?.name || "",
+    phone: (sd?.callbackNumber && sd.callbackNumber !== "Same number")
+      ? sd.callbackNumber
+      : (sd?.phone || sd?.from || ""),
+    address: sd?.serviceAddress || sd?.address || "",
+    description: [
+      sd?.jobType ? `jobType: ${sd.jobType}` : "",
+      sd?.location ? `location: ${sd.location}` : "",
+      sd?.size ? `size: ${sd.size}` : "",
+      sd?.tier ? `tier: ${sd.tier}` : "",
+      sd?.deadline ? `deadline: ${sd.deadline}` : "",
+      sd?.preferredWindow ? `preferredWindow: ${sd.preferredWindow}` : "",
+      sd?.specialItems?.length ? `specialItems: ${sd.specialItems.join(", ")}` : "",
+      sd?.escalate ? `escalate: true (${sd?.escalationReason || ""})` : "",
+    ].filter(Boolean).join(" | "),
+  };
 
   // Push to Google Sheet (Apps Script webhook)
   try {
     if (!process.env.SHEETS_WEBHOOK_URL) {
       console.warn("SHEETS_WEBHOOK_URL is missing; skipping sheet write.");
     } else {
-      await fetch(process.env.SHEETS_WEBHOOK_URL, {
+      const r = await fetch(process.env.SHEETS_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: req.body.name || "",
-          phone: req.body.phone || req.body.from || "",
-          address: req.body.address || "",
-          description: req.body.description || "",
-          jobId
-        }),
+        body: JSON.stringify(payload),
       });
-      console.log("✅ Sheet write attempted for", jobId);
+      const text = await r.text();
+      console.log("Sheets status:", r.status, "body:", text);
     }
   } catch (err) {
     console.error("❌ Sheet write failed:", err?.message || err);
-    // Don't fail the intake response just because Sheets failed
   }
 
   return res.json({
+    ok: true,
     jobId,
     photoLink: `${base}/upload?job=${jobId}`,
   });
 });
+
 
 
 
