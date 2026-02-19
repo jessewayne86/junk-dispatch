@@ -7,6 +7,21 @@ const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends form-encoded by default
 
+// ===== CALLID -> JOBID (for end-of-call update) =====
+// NOTE: This is in-memory. If Railway restarts mid-call, mapping can be lost.
+// Best long-term: store this in a DB/Redis OR ensure jobId is included in end-of-call structured data.
+const callIdToJobId = new Map();
+
+function getCallIdFromVapiMessage(message) {
+  return (
+    message?.call?.id ||
+    message?.callId ||
+    message?.conversationId ||
+    message?.id ||
+    null
+  );
+}
+
 // ===== HELPERS =====
 async function postToSheet(payload) {
   if (!process.env.SHEETS_WEBHOOK_URL) {
@@ -28,7 +43,7 @@ async function postToSheet(payload) {
   }
 }
 
-function buildPayloadFromStructuredData(sd, jobId) {
+function buildPayloadFromStructuredData(sd, jobId, sourceValue = "vapi") {
   const phone =
     sd?.callbackNumber && sd.callbackNumber !== "Same number"
       ? sd.callbackNumber
@@ -38,12 +53,16 @@ function buildPayloadFromStructuredData(sd, jobId) {
     ? sd.specialItems.join(", ")
     : (sd?.specialItems || "");
 
+  const accessText = Array.isArray(sd?.access)
+    ? sd.access.join(", ")
+    : (sd?.access || "");
+
   // Build a clean scope description (still one cell, but structured)
   const scopeParts = [
     sd?.jobType ? `jobType: ${sd.jobType}` : "",
     sd?.location ? `location: ${sd.location}` : "",
     sd?.size ? `size: ${sd.size}` : "",
-    sd?.access ? `access: ${Array.isArray(sd.access) ? sd.access.join(", ") : sd.access}` : "",
+    accessText ? `access: ${accessText}` : "",
     specialItemsText ? `specialItems: ${specialItemsText}` : "",
     sd?.deadline ? `deadline: ${sd.deadline}` : "",
   ].filter(Boolean);
@@ -52,7 +71,7 @@ function buildPayloadFromStructuredData(sd, jobId) {
     // ✅ Match your sheet columns (Jobs header row)
     "Job ID": jobId,
     "Created At": new Date().toISOString(),
-    "Source": sd?.source || "vapi",
+    "Source": sourceValue,
 
     "Customer Name": sd?.name || "",
     "Customer Phone": phone,
@@ -64,6 +83,7 @@ function buildPayloadFromStructuredData(sd, jobId) {
     "Job Type": sd?.jobType || "",
     "Items / Scope Description": scopeParts.join(" | "),
 
+    // Your sheet header is "Preferred Timing"
     "Preferred Timing": sd?.preferredWindow || "",
     "Urgent (Y/N)": (sd?.urgent || sd?.urgent_flag) ? "Y" : "N",
 
@@ -72,12 +92,8 @@ function buildPayloadFromStructuredData(sd, jobId) {
     // You can use these for internal tracking on intake
     "Intake Notes": sd?.intakeNotes || "",
     "Status": sd?.status || "New",
-
-    // Optional: helps debugging
-    "Webhook Event": "call-end",
   };
 }
-
 
 // ===== ROUTES =====
 app.get("/health", (req, res) => {
@@ -87,7 +103,8 @@ app.get("/health", (req, res) => {
 /**
  * VAPI WEBHOOK
  * This is where Vapi sends call events.
- * We write to the sheet when the call ends (end-of-call-report).
+ * We write to the sheet when the call ends (end-of-call-report),
+ * AND we reuse the jobId created during /intake so Apps Script can update the same row.
  */
 app.post("/vapi/webhook", async (req, res) => {
   try {
@@ -99,13 +116,22 @@ app.post("/vapi/webhook", async (req, res) => {
     // ✅ Only write to sheet on end-of-call-report (best signal + clean data)
     if (message?.type === "end-of-call-report") {
       const sd = message?.analysis?.structuredData || {};
-      const jobId = "job_" + Math.random().toString(36).slice(2, 9);
 
-      const payload = buildPayloadFromStructuredData(sd, jobId);
+      const callId = getCallIdFromVapiMessage(message);
+
+      // Prefer a jobId provided in structuredData (best, survives restarts),
+      // otherwise use in-memory map from /intake,
+      // otherwise fallback to a random jobId (will create a new row).
+      const jobId =
+        (sd && (sd["Job ID"] || sd.jobId)) ||
+        (callId ? callIdToJobId.get(callId) : null) ||
+        ("job_" + Math.random().toString(36).slice(2, 9));
+
+      const payload = buildPayloadFromStructuredData(sd, jobId, "call-end");
 
       try {
         await postToSheet(payload);
-        console.log("✅ End-of-call row written:", jobId);
+        console.log("✅ End-of-call upsert sent:", { jobId, callId });
       } catch (err) {
         console.error("❌ Sheet write failed (end-of-call):", err?.message || err);
       }
@@ -125,9 +151,10 @@ app.post("/twilio/call-status", (req, res) => {
 });
 
 /**
- * OPTIONAL: /intake
- * Use this if you create a Vapi Tool called create_intake that calls this endpoint mid-call.
- * It returns jobId + photoLink and ALSO writes a row (source: intake).
+ * /intake
+ * Called mid-call by create_intake tool.
+ * It returns jobId + photoLink and writes the FIRST row (source: intake).
+ * We also store callId -> jobId so end-of-call can update the same row.
  */
 app.post("/intake", async (req, res) => {
   console.log("Intake raw body:", JSON.stringify(req.body).slice(0, 2000));
@@ -139,15 +166,30 @@ app.post("/intake", async (req, res) => {
 
   const jobId = "job_" + Math.random().toString(36).slice(2, 9);
   const base = process.env.BASE_URL || "https://example.com";
+  const photoLink = `${base}/upload?job=${jobId}`;
 
-  const payload = {
-    ...buildPayloadFromStructuredData(sd, jobId),
-    source: "intake",
-  };
+  // Try to capture callId from multiple possible shapes
+  const callId =
+    req.body?.call?.id ||
+    req.body?.callId ||
+    req.body?.message?.call?.id ||
+    req.body?.message?.callId ||
+    sd?.callId ||
+    null;
+
+  if (callId) {
+    callIdToJobId.set(callId, jobId);
+    console.log("✅ Stored callId -> jobId:", { callId, jobId });
+  } else {
+    console.warn("⚠️ No callId found on /intake; end-of-call may create a new row.");
+  }
+
+  // Ensure the sheet has the photo link on intake
+  const payload = buildPayloadFromStructuredData({ ...sd, photoLink }, jobId, "intake");
 
   try {
     await postToSheet(payload);
-    console.log("✅ Intake row written:", jobId);
+    console.log("✅ Intake row written:", { jobId, callId });
   } catch (err) {
     console.error("❌ Sheet write failed (intake):", err?.message || err);
     // Don't fail the call flow because Sheets failed
@@ -156,7 +198,7 @@ app.post("/intake", async (req, res) => {
   return res.json({
     ok: true,
     jobId,
-    photoLink: `${base}/upload?job=${jobId}`,
+    photoLink,
   });
 });
 
