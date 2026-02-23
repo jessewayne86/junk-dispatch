@@ -92,6 +92,12 @@ async function notifyOwnerEmail({ from, to, body, media }) {
     mediaBlock +
     `\n\n(Reply by calling/texting manually for now until A2P is active.)`;
 
+  console.log("SENDGRID CHECK:", {
+  hasKey: !!process.env.SENDGRID_API_KEY,
+  to: process.env.ALERT_EMAIL_TO,
+  from: process.env.ALERT_EMAIL_FROM
+});
+  
   await sgMail.send({
     to: ALERT_EMAIL_TO,
     from: ALERT_EMAIL_FROM,
