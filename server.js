@@ -51,6 +51,45 @@ if (SENDGRID_API_KEY) {
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 // ===== HELPERS =====
+function guessExt(contentType = "") {
+  const ct = contentType.toLowerCase();
+  if (ct.includes("jpeg")) return "jpg";
+  if (ct.includes("png")) return "png";
+  if (ct.includes("gif")) return "gif";
+  if (ct.includes("webp")) return "webp";
+  if (ct.includes("pdf")) return "pdf";
+  return "bin";
+}
+
+async function downloadTwilioMediaAsAttachment(mediaUrl, index = 0) {
+  // Twilio MediaUrl requires auth
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+  const resp = await fetch(mediaUrl, {
+    method: "GET",
+    headers: {
+      Authorization: `Basic ${auth}`,
+    },
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to download media (${resp.status}): ${text.slice(0, 200)}`);
+  }
+
+  const contentType = resp.headers.get("content-type") || "application/octet-stream";
+  const ext = guessExt(contentType);
+
+  const arrayBuffer = await resp.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  return {
+    content: buffer.toString("base64"),
+    filename: `photo-${index + 1}.${ext}`,
+    type: contentType,
+    disposition: "attachment",
+  };
+}
 function extractMedia(reqBody) {
   const numMedia = parseInt(reqBody.NumMedia || "0", 10);
   const media = [];
@@ -80,8 +119,19 @@ async function notifyOwnerSms({ from, body, firstPhotoUrl }) {
 async function notifyOwnerEmail({ from, to, body, media }) {
   if (!SENDGRID_API_KEY || !ALERT_EMAIL_TO || !ALERT_EMAIL_FROM) return;
 
-  const mediaBlock = media.length
-    ? `\n\nPhotos:\n${media.map(m => `${m.type || "media"}: ${m.url}`).join("\n")}`
+  // Build attachments by downloading Twilio-protected media
+  const attachments = [];
+  for (let i = 0; i < (media?.length || 0); i++) {
+    try {
+      const att = await downloadTwilioMediaAsAttachment(media[i].url, i);
+      attachments.push(att);
+    } catch (err) {
+      console.error("Media download failed:", media[i]?.url, err?.message || err);
+    }
+  }
+
+  const mediaSummary = (media?.length || 0)
+    ? `\n\nPhotos attached: ${attachments.length}/${media.length}`
     : `\n\nPhotos: (none)`;
 
   const text =
@@ -89,21 +139,19 @@ async function notifyOwnerEmail({ from, to, body, media }) {
     `From: ${from}\n` +
     `To: ${to}\n\n` +
     `Message:\n${body}` +
-    mediaBlock +
+    mediaSummary +
     `\n\n(Reply by calling/texting manually for now until A2P is active.)`;
 
-  console.log("SENDGRID CHECK:", {
-  hasKey: !!process.env.SENDGRID_API_KEY,
-  to: process.env.ALERT_EMAIL_TO,
-  from: process.env.ALERT_EMAIL_FROM
-});
-  
   await sgMail.send({
     to: ALERT_EMAIL_TO,
     from: ALERT_EMAIL_FROM,
     subject: `New SMS lead from ${from}`,
     text,
+    // optional html body:
+    html: `<pre style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;">${text}</pre>`,
+    attachments: attachments.length ? attachments : undefined,
   });
+}
 }
 
 // ===== ROUTES =====
