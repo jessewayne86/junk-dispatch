@@ -152,7 +152,6 @@ async function notifyOwnerEmail({ from, to, body, media }) {
     attachments: attachments.length ? attachments : undefined,
   });
 }
-}
 
 // ===== ROUTES =====
 
